@@ -1,0 +1,21 @@
+# macOS requirements (CPU + MPS via Metal)
+# Tested on macOS 14+ (Apple Silicon or Intel)
+# Install: pip install -r requirements_macos.txt
+
+# PyTorch — MPS backend (no CUDA on macOS)
+torch==2.7.0
+torchvision==0.22.0
+
+# Scientific stack
+numpy>=1.26,<2.0
+scipy>=1.13
+pandas>=2.2
+
+# RL environment
+gymnasium>=0.29
+mujoco>=3.1          # MyoSuite dependency
+myosuite>=2.4.0
+
+# Utilities
+tqdm>=4.66
+pyyaml>=6.0
