@@ -1,3 +1,6 @@
 data/
+Ulrich_data/
 .DS_Store
+*.pyc
+*.pt
 

@@ -229,7 +229,7 @@ class GAILTrainer:
         disc_batch:    int   = 64,
         gp_lambda:     float = 10.0,       # 0 to disable GP
         # general
-        rollout_len:   int   = 512,
+        rollout_len:   int   = 2048,
         lr_policy:     float = 3e-4,
         lr_disc:       float = 1e-4,
         source_aware:  bool  = False,
@@ -288,10 +288,51 @@ class GAILTrainer:
 
     # ── rollout collection ────────────────────────────────────────────────
 
+    def _demo_reset(self) -> torch.Tensor:
+        """
+        Reset the env to a random frame from the expert demonstrations,
+        then override the sim state to match that demo's joint angles/velocities.
+        Falls back to env.reset() if the env doesn't support state injection.
+        """
+        idx = np.random.randint(0, len(self.expert_ds))
+        s, _, _ = self.expert_ds[idx]                    # (S,) tensor
+        demo_state = s.numpy().astype(np.float64)
+
+        wrapper = self.env
+        obs, _ = wrapper.reset()
+
+        try:
+            sim  = wrapper.unwrapped.sim
+            half = len(demo_state) // 2
+            angs = demo_state[:half]   # pelvis(3) + leg(10) + lumbar(3)
+            vels = demo_state[half:]
+
+            qpos = sim.data.qpos.copy()
+            qvel = sim.data.qvel.copy()
+
+            # pelvis rotation: keep neutral quaternion from reset (avoids floating)
+            qpos[wrapper._root_qpos_adr + 3] = 1.0
+            qpos[wrapper._root_qpos_adr + 4 : wrapper._root_qpos_adr + 7] = 0.0
+            # pelvis angular velocity
+            qvel[wrapper._root_qvel_adr + 3 : wrapper._root_qvel_adr + 6] = vels[:3]
+
+            # leg joint angles + velocities
+            for i, (qa, qv) in enumerate(zip(wrapper._leg_qpos, wrapper._leg_qvel)):
+                qpos[qa] = angs[3 + i]
+                qvel[qv] = vels[3 + i]
+
+            sim.data.qpos[:] = qpos
+            sim.data.qvel[:] = qvel
+            sim.forward()
+            obs = wrapper._extract()
+        except Exception as e:
+            print(f"[_demo_reset] state injection failed: {e} — using default reset")
+
+        return torch.tensor(obs, dtype=torch.float32, device=self.device)
+
     def _collect_rollout(self, mocap_source: int = 0) -> RolloutBuffer:
-        buf  = RolloutBuffer()
-        obs, _ = self.env.reset()
-        obs  = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        buf = RolloutBuffer()
+        obs = self._demo_reset()
 
         for _ in range(self.rollout_len):
             with torch.no_grad():
@@ -316,8 +357,7 @@ class GAILTrainer:
             obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
 
             if done:
-                obs, _ = self.env.reset()
-                obs    = torch.tensor(obs, dtype=torch.float32, device=self.device)
+                obs = self._demo_reset()
 
         return buf
 

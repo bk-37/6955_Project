@@ -218,6 +218,107 @@ class ExpertData:
         print(f"             T={self.T}, S={self.S}, A={self.A}, dt={dt:.4f}s")
 
 
+ULRICH_DIR = Path(__file__).parent / "Ulrich_data"
+
+# Bare muscle names in results_forces.sto (no _activation suffix)
+ULRICH_MUSCLE_COLS = [c.replace("_activation", "") for c in EMG_COLS]
+
+
+class UlrichExpertData:
+    """
+    Loads one subject/trial from the Ulrich static-optimisation dataset.
+
+    Directory layout:
+      Ulrich_data/{Subject}/IK/{trial}/output/results_ik.sto
+      Ulrich_data/{Subject}/StaticOpt/{trial}/results_forces.sto
+
+    Produces states/actions with identical shape and semantics to ExpertData
+    so it can be mixed freely with OpenCap data.
+    """
+
+    def __init__(
+        self,
+        subject:       str,
+        trial:         str,
+        add_vel:       bool  = True,
+        smooth_ik_hz:  float = 6.0,
+        smooth_act_hz: float = 10.0,
+    ):
+        ik_path  = ULRICH_DIR / subject / "IK" / trial / "output" / "results_ik.sto"
+        act_path = ULRICH_DIR / subject / "StaticOpt" / trial / "results_forces.sto"
+
+        ik_raw  = parse_opensim(ik_path)
+        act_raw = parse_opensim(act_path)
+
+        t_common = ik_raw["time"].values
+        dt = float(np.median(np.diff(t_common)))
+        fs = 1.0 / dt
+
+        # IK angles → radians (inDegrees=yes in Ulrich IK files)
+        ik_angles = deg2rad(ik_raw[IK_ROTATIONAL_COLS].values.astype(np.float32))
+
+        if smooth_ik_hz and smooth_ik_hz < fs / 2:
+            ik_angles = lowpass(ik_angles, cutoff_hz=smooth_ik_hz, fs=fs).astype(np.float32)
+
+        if add_vel:
+            ik_vel  = compute_velocity(ik_angles, dt).astype(np.float32)
+            ik_feat = np.concatenate([ik_angles, ik_vel], axis=1)
+        else:
+            ik_feat = ik_angles
+
+        # Static-opt activations — resample to IK time grid if needed
+        act_t    = act_raw["time"].values
+        act_vals = act_raw[ULRICH_MUSCLE_COLS].values.astype(np.float64)
+
+        if not np.allclose(act_t, t_common, atol=1e-4):
+            interp   = interp1d(act_t, act_vals, axis=0, kind="linear",
+                                fill_value="extrapolate")
+            act_vals = interp(t_common)
+
+        if smooth_act_hz and smooth_act_hz < fs / 2:
+            act_vals = lowpass(act_vals, cutoff_hz=smooth_act_hz, fs=fs)
+
+        act_vals = clip_and_normalize_emg(act_vals).astype(np.float32)
+
+        self.states  = ik_feat
+        self.actions = act_vals
+        self.grf     = None
+        self.time    = t_common
+        self.dt      = dt
+        self.T, self.S = ik_feat.shape
+        self.A         = act_vals.shape[1]
+
+        print(f"[UlrichExpertData] {subject}/{trial}")
+        print(f"                   T={self.T}, S={self.S}, A={self.A}, dt={dt:.4f}s")
+
+
+def load_ulrich_multi(
+    subjects: list[str],
+    trials:   list[str],
+    **kwargs,
+) -> "UlrichExpertData":
+    """
+    Load and concatenate Ulrich data across subjects/trials.
+    Skips missing files gracefully, same as load_multi.
+    """
+    parts = []
+    for subj in subjects:
+        for trial in trials:
+            try:
+                parts.append(UlrichExpertData(subj, trial, **kwargs))
+            except FileNotFoundError as e:
+                print(f"[load_ulrich_multi] skipping {subj}/{trial}: {e}")
+
+    if not parts:
+        raise RuntimeError("No Ulrich data loaded — check subject/trial names.")
+
+    combined = parts[0]
+    combined.states  = np.concatenate([p.states  for p in parts], axis=0)
+    combined.actions = np.concatenate([p.actions for p in parts], axis=0)
+    combined.T       = combined.states.shape[0]
+    return combined
+
+
 def load_multi(
     subjects: list[str],
     trials:   list[str],

@@ -9,6 +9,57 @@ The core framing is **RL**: the agent observes joint angles (state) and outputs 
 
 ---
 
+## Environment setup
+
+**Python 3.11 is required.** Python 3.12+ will likely fail to build `dm-tree` and `labmaze` (C++ dependencies of MyoSuite) as pre-built wheels are not available for those versions.
+
+### Create a fresh conda environment
+
+```bash
+conda create -n OpenCap_RL python=3.11
+conda activate OpenCap_RL
+```
+
+---
+
+### Option A — NVIDIA RTX 5090 (Blackwell, CUDA 12.8)
+
+Requires CUDA 12.8 toolkit: https://developer.nvidia.com/cuda-12-8-0-download-archive
+
+```bash
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements_windows_5090.txt
+```
+
+---
+
+### Option B — CPU only (no GPU / all other machines)
+
+```bash
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements_cpu.txt
+```
+
+> **Note:** Training will be significantly slower without a GPU. CPU mode is suitable for development, debugging, and evaluation, but not recommended for full GAIL runs.
+
+---
+
+### Troubleshooting build failures
+
+If `dm-tree` or `labmaze` fail to build from source, you are likely missing system-level build tools:
+
+| Package | Error | Fix |
+|---|---|---|
+| `dm-tree` | `CMake must be installed` | Install CMake from https://cmake.org/download/ — select *Add to PATH* during install, then restart your terminal |
+| `labmaze` | `command 'bazel' failed` | Install Bazelisk from https://github.com/bazelbuild/bazelisk/releases — download `bazelisk-windows-amd64.exe`, rename to `bazel.exe`, place on PATH |
+
+For `dm-tree` you can also try skipping the source build entirely:
+```bash
+pip install dm-tree --only-binary=:all:
+```
+
+---
+
 ## File layout
 
 ```
@@ -48,7 +99,9 @@ AI_Project/
 ├── bc_policy.py        ← policy network + BC trainer
 ├── gail.py             ← discriminator + PPO + GAIL loop
 ├── train.py            ← entry point
-└── evaluate.py         ← quantitative evaluation
+├── evaluate.py         ← quantitative evaluation
+├── requirements_windows_5090.txt   ← GPU deps (RTX 5090 / CUDA 12.8)
+└── requirements_cpu.txt            ← CPU-only deps
 ```
 
 ### Trial names (per subject)
@@ -133,10 +186,7 @@ Static optimization activations (`OpenSimData/Mocap/SO/{trial}.sto`) are also av
 
 ### 1. Install dependencies
 
-```bash
-pip install -r requirements.txt
-pip install myosuite
-```
+See [Environment setup](#environment-setup) above for the correct install commands for your hardware.
 
 ### 2. Phase 1 — BC pre-training
 

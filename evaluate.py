@@ -119,7 +119,7 @@ def discriminator_score(
     Close to 1.0 = discriminator thinks the policy looks like the expert.
     """
     disc.eval(); policy.eval()
-    idx     = np.random.choice(expert.T, n_samples, replace=False)
+    idx     = np.random.choice(expert.T, min(n_samples, expert.T), replace=False)
     states  = torch.from_numpy(expert.states[idx]).to(device)
 
     with torch.no_grad():
@@ -136,35 +136,83 @@ def discriminator_score(
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def render_policy(policy: BCPolicy, state_dim: int, action_dim: int, n_episodes: int = 3):
+    """
+    Roll out the policy in MyoSuite with live rendering.
+    Requires MyoSuite + a display (or a virtual framebuffer on headless machines).
+    """
+    try:
+        import myosuite  # noqa: F401
+        import gymnasium as gym
+        from train import ENV_ID, IKObsWrapper
+    except ImportError:
+        print("[render] MyoSuite / gymnasium not installed — cannot render.")
+        return
+
+    import time
+    env = IKObsWrapper(gym.make(ENV_ID))
+    policy.eval()
+
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        total_r = 0.0
+        steps = 0
+        while not done:
+            env.unwrapped.mj_render()
+            time.sleep(1 / 60)
+            state_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
+            with torch.no_grad():
+                action = policy(state_t).squeeze(0).numpy()
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            total_r += reward
+            steps += 1
+        print(f"  Episode {ep+1}: {steps} steps, total reward = {total_r:.2f}")
+
+    env.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy_ckpt", required=True)
     parser.add_argument("--disc_ckpt",   default=None)
-    parser.add_argument("--source",      choices=["markered", "markerless", "both"],
-                        default="markered")
+    parser.add_argument("--subject",     nargs="+", default=["subject10"])
+    parser.add_argument("--trial",       nargs="+", default=["walking1"])
+    parser.add_argument("--source",      default="Mocap",
+                        help='IK source: "Mocap", "Video/HRNet/2-cameras", etc. '
+                             'Use "both" to compare Mocap vs a second source.')
+    parser.add_argument("--source2",     default=None,
+                        help="Second IK source for side-by-side comparison.")
+    parser.add_argument("--render",      action="store_true",
+                        help="Roll out the policy in MyoSuite with live rendering.")
+    parser.add_argument("--render_eps",  type=int, default=3,
+                        help="Number of episodes to render (default: 3).")
     parser.add_argument("--device",      default="cpu")
     args = parser.parse_args()
 
-    device  = args.device
-    expert  = build_expert("markered")
-    S, A    = state_dim_from_expert(expert), expert.A
+    device = args.device
+    expert = build_expert(args.subject, args.trial, source=args.source)
+    S, A   = state_dim_from_expert(expert), expert.A
 
-    policy  = BCPolicy(state_dim=S, action_dim=A)
+    policy = BCPolicy(state_dim=S, action_dim=A)
     policy.load_state_dict(torch.load(args.policy_ckpt, map_location=device))
-    policy  = policy.to(device)
+    policy = policy.to(device)
 
-    if args.source == "both":
-        markerless = build_expert("markerless")
+    if args.source2:
+        markerless = build_expert(args.subject, args.trial, source=args.source2)
         compare_sources(policy, expert, markerless, device)
     else:
-        tgt = build_expert(args.source)
-        evaluate_bc(policy, tgt, device)
+        evaluate_bc(policy, expert, device)
 
     if args.disc_ckpt:
         disc = Discriminator(state_dim=S, action_dim=A)
         disc.load_state_dict(torch.load(args.disc_ckpt, map_location=device))
         disc = disc.to(device)
         discriminator_score(disc, policy, expert, device)
+
+    if args.render:
+        render_policy(policy, S, A, n_episodes=args.render_eps)
 
 
 if __name__ == "__main__":

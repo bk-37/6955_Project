@@ -1,0 +1,22 @@
+# CPU-only requirements (no GPU / non-5090 machines)
+# Compatible with Python 3.11 (recommended)
+#
+# Install PyTorch first (CPU build):
+#   pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
+#
+# Then install the rest:
+#   pip install -r requirements_cpu.txt
+
+# Scientific stack
+numpy>=1.26,<2.0
+scipy>=1.13
+pandas>=2.2
+
+# RL environment
+gymnasium>=0.29
+mujoco>=3.1          # MyoSuite dependency
+myosuite>=2.4.0
+
+# Utilities
+tqdm>=4.66
+pyyaml>=6.0

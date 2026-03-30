@@ -84,7 +84,7 @@ class BCPolicy(nn.Module):
     def get_distribution(self, state: torch.Tensor):
         """Returns a Normal distribution clamped to [0,1] via sigmoid transform."""
         mean = self.forward(state)
-        std  = self.log_std.exp().clamp(1e-4, 1.0)
+        std  = self.log_std.clamp(-2.0, 0.5).exp()
         return torch.distributions.Normal(mean, std)
 
     def sample(self, state: torch.Tensor):
