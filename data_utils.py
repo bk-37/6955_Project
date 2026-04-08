@@ -23,7 +23,7 @@ from torch.utils.data import Dataset, DataLoader
 
 # ── path helpers ─────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "OpenCap_data"
 
 
 def get_ik_path(subject: str, trial: str, source: str = "Mocap") -> Path:
@@ -218,10 +218,12 @@ class ExpertData:
         print(f"             T={self.T}, S={self.S}, A={self.A}, dt={dt:.4f}s")
 
 
-ULRICH_DIR = Path(__file__).parent / "Ulrich_data"
+ULRICH_DIR = Path(__file__).parent / "Ulrich_Treadmill_Data"
 
-# Bare muscle names in results_forces.sto (no _activation suffix)
+# Bare muscle names (no _activation suffix) — used to build full OpenSim path
+# e.g. "bflh_r" → "/forceset/bflh_r/activation" in results_states.sto
 ULRICH_MUSCLE_COLS = [c.replace("_activation", "") for c in EMG_COLS]
+ULRICH_MUSCLE_COLS_FULL = [f"/forceset/{m}/activation" for m in ULRICH_MUSCLE_COLS]
 
 
 class UlrichExpertData:
@@ -229,8 +231,8 @@ class UlrichExpertData:
     Loads one subject/trial from the Ulrich static-optimisation dataset.
 
     Directory layout:
-      Ulrich_data/{Subject}/IK/{trial}/output/results_ik.sto
-      Ulrich_data/{Subject}/StaticOpt/{trial}/results_forces.sto
+      Ulrich_Treadmill_Data/{Subject}/IK/{trial}/output/results_ik.sto
+      Ulrich_Treadmill_Data/{Subject}/StaticOpt/{trial}/results_states.sto
 
     Produces states/actions with identical shape and semantics to ExpertData
     so it can be mixed freely with OpenCap data.
@@ -245,7 +247,7 @@ class UlrichExpertData:
         smooth_act_hz: float = 10.0,
     ):
         ik_path  = ULRICH_DIR / subject / "IK" / trial / "output" / "results_ik.sto"
-        act_path = ULRICH_DIR / subject / "StaticOpt" / trial / "results_forces.sto"
+        act_path = ULRICH_DIR / subject / "StaticOpt" / trial / "results_states.sto"
 
         ik_raw  = parse_opensim(ik_path)
         act_raw = parse_opensim(act_path)
@@ -266,9 +268,9 @@ class UlrichExpertData:
         else:
             ik_feat = ik_angles
 
-        # Static-opt activations — resample to IK time grid if needed
+        # Static-opt activations — columns are "/forceset/{muscle}/activation"
         act_t    = act_raw["time"].values
-        act_vals = act_raw[ULRICH_MUSCLE_COLS].values.astype(np.float64)
+        act_vals = act_raw[ULRICH_MUSCLE_COLS_FULL].values.astype(np.float64)
 
         if not np.allclose(act_t, t_common, atol=1e-4):
             interp   = interp1d(act_t, act_vals, axis=0, kind="linear",

@@ -1,5 +1,5 @@
-data/
-Ulrich_data/
+OpenCap_data/
+Ulrich_Treadmill_data/
 .DS_Store
 *.pyc
 *.pt
