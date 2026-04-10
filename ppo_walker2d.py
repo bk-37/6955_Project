@@ -85,8 +85,9 @@ def load_ulrich_reference(subjects: list[int] | None = None,
             orig_x = np.arange(orig_len)
             new_x = np.linspace(0, orig_len - 1, new_len)
 
+            from scipy.interpolate import CubicSpline
             def resamp(key):
-                return np.interp(new_x, orig_x, d[key])
+                return CubicSpline(orig_x, d[key])(new_x)
 
             # Walker2d joint axes are all [0, -1, 0] (negative Y).
             # A positive rotation in OpenSim around +Y maps to negative in Walker2d.

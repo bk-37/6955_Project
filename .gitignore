@@ -1,5 +1,6 @@
 OpenCap_data/
 Ulrich_Treadmill_data/
+gait_cycles/
 .DS_Store
 *.pyc
 *.pt

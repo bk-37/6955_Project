@@ -42,6 +42,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import mujoco
 import numpy as np
 from gymnasium import spaces
 from gymnasium.envs.mujoco.walker2d_v4 import Walker2dEnv
@@ -62,17 +63,18 @@ REF_HZ  = 50.0    # Ulrich IK / extracted gait cycles
 # ── reference loading ─────────────────────────────────────────────────────────
 
 def load_ref_cycle(path: Path) -> np.ndarray:
-    """Load a single gait cycle .npy, resample to CTRL_HZ."""
+    """Load a single gait cycle .npy, resample to CTRL_HZ with cubic spline."""
+    from scipy.interpolate import CubicSpline
     raw   = np.load(path).astype(np.float32)
     n_in  = len(raw)
     n_out = int(round(n_in * CTRL_HZ / REF_HZ))
     x_in  = np.linspace(0, 1, n_in)
     x_out = np.linspace(0, 1, n_out)
     ref   = np.stack(
-        [np.interp(x_out, x_in, raw[:, j]) for j in range(raw.shape[1])],
+        [CubicSpline(x_in, raw[:, j])(x_out) for j in range(raw.shape[1])],
         axis=1,
     ).astype(np.float32)
-    print(f"Gait cycle: {n_in} frames @ {REF_HZ}Hz -> {n_out} frames @ {CTRL_HZ}Hz")
+    print(f"Gait cycle: {n_in} frames @ {REF_HZ}Hz -> {n_out} frames @ {CTRL_HZ}Hz (cubic spline)")
     return ref
 
 
@@ -111,26 +113,26 @@ class Walker2dPhaseAware(Walker2dEnv):
         reference:          np.ndarray,   # (T, 6) float32 @ CTRL_HZ
         imitation_weight:   float = 4.0,
         vel_weight:         float = 1.0,
-        forward_weight:     float = 1.0,
-        v_target:           float = 1.25,  # m/s
-        imit_scale:         float = 8.0,   # sharpness of exp(-k·err²)
-        max_phase_advance:  int   = 4,     # max frames to skip per step
-        contact_weight:     float = 2.0,
-        pose_term_thresh:   float = 0.9,   # rad — hip/knee termination
-        ankle_term_thresh:  float = 0.40,  # rad — ankle termination (looser)
+        ee_weight:          float = 4.0,  # end-effector foot position tracking
+        root_weight:        float = 2.0,  # root height + pitch tracking
+        contact_weight:     float = 1.0,
+        imit_scale:         float = 8.0,  # sharpness of exp(-k·err²)
+        max_phase_advance:  int   = 4,    # max frames to skip per step
+        pose_term_thresh:   float = 0.9,  # rad — hip/knee termination
+        ankle_term_thresh:  float = 0.40, # rad — ankle termination (looser)
         warm_start:         bool  = True,
-        product_reward:     bool  = False, # True → DeepMimic product-of-exps form
+        product_reward:     bool  = False,
         **kwargs,
     ):
         self._reference         = reference
         self._ref_len           = len(reference)
         self._imitation_weight  = imitation_weight
         self._vel_weight        = vel_weight
-        self._forward_weight    = forward_weight
-        self._v_target          = v_target
+        self._ee_weight         = ee_weight
+        self._root_weight       = root_weight
+        self._contact_weight    = contact_weight
         self._imit_scale        = imit_scale
         self._max_phase_advance = max_phase_advance
-        self._contact_weight    = contact_weight
         self._pose_term_thresh  = pose_term_thresh
         self._ankle_term_thresh = ankle_term_thresh
         self._warm_start        = warm_start
@@ -159,34 +161,80 @@ class Walker2dPhaseAware(Walker2dEnv):
             dtype = np.float32,
         )
 
+        # Pre-compute reference foot positions (world z and root-relative x)
+        # and root height via FK — used for EE and root reward terms.
+        self._precompute_reference_kinematics()
+
     def _get_obs(self) -> np.ndarray:
         base    = super()._get_obs()                       # (17,)
         q_ref   = self._reference[self._phase]             # (6,)
-        phi     = 2.0 * np.pi * self._phase / self._ref_len
+        # Normalize phase to gait cycle period, not reference length.
+        # With long references (7570 frames) the full sin/cos cycle would
+        # take 60s — useless as a within-stride signal. Normalizing to
+        # GAIT_CYCLE_FRAMES keeps the encoding meaningful regardless of
+        # whether we use a single extracted cycle or a long continuous ref.
+        GAIT_CYCLE_FRAMES = 140  # ~1.1s @ 125Hz
+        phi = 2.0 * np.pi * (self._phase % GAIT_CYCLE_FRAMES) / GAIT_CYCLE_FRAMES
         phase_enc = np.array([np.sin(phi), np.cos(phi)], dtype=np.float32)
         return np.concatenate([base, q_ref, phase_enc])    # (25,)
+
+    # ── reference FK pre-computation ──────────────────────────────────────
+
+    def _precompute_reference_kinematics(self) -> None:
+        """
+        For each reference frame run FK to get:
+          - ref_root_height: torso z in world frame
+          - ref_foot_r/l_x_rel: foot x relative to root (forward placement)
+          - ref_foot_r/l_z: foot z in world frame (swing elevation signal)
+
+        Using world-z for feet rather than root-relative-z is critical:
+        root-relative z is always negative (~-1.1m) with no swing signal.
+        World-z is ~0 at stance and positive during swing.
+        """
+        n = self._ref_len
+        self._ref_root_height  = np.zeros(n, dtype=np.float32)
+        self._ref_foot_r_xrel  = np.zeros(n, dtype=np.float32)  # foot x relative to root
+        self._ref_foot_l_xrel  = np.zeros(n, dtype=np.float32)
+        self._ref_foot_r_z     = np.zeros(n, dtype=np.float32)  # foot world z
+        self._ref_foot_l_z     = np.zeros(n, dtype=np.float32)
+
+        qpos_save = self.data.qpos.copy()
+        qvel_save = self.data.qvel.copy()
+
+        for t in range(n):
+            self.data.qpos[:] = 0.0
+            self.data.qpos[1] = 1.28    # nominal standing height
+            self.data.qpos[3:9] = self._reference[t]
+            self.data.qvel[:] = 0.0
+            mujoco.mj_kinematics(self.model, self.data)
+
+            root = self.data.body("torso").xpos
+            ftr  = self.data.body("foot").xpos
+            ftl  = self.data.body("foot_left").xpos
+
+            self._ref_root_height[t]  = float(root[2])
+            self._ref_foot_r_xrel[t]  = float(ftr[0] - root[0])
+            self._ref_foot_l_xrel[t]  = float(ftl[0] - root[0])
+            self._ref_foot_r_z[t]     = float(ftr[2] - root[2])  # root-relative z
+            self._ref_foot_l_z[t]     = float(ftl[2] - root[2])
+
+        # Restore original state
+        self.data.qpos[:] = qpos_save
+        self.data.qvel[:] = qvel_save
+        mujoco.mj_kinematics(self.model, self.data)
 
     # ── phase tracking ────────────────────────────────────────────────────
 
     def _advance_phase(self) -> None:
+        """Fixed-rate phase clock — advances exactly 1 frame per env step.
+
+        DeepMimic uses a fixed clock tied to real time, not joint matching.
+        Adaptive phase lets the agent 'shop' for frames where its stiff legs
+        match the reference (extended-knee phases), preventing it from ever
+        learning knee flexion during swing. A fixed clock forces it to be at
+        the correct phase regardless of its current state.
         """
-        Search forward up to max_phase_advance frames and lock to the
-        candidate whose reference joints are closest to the current sim state.
-
-        Always advances by at least 1 (phase never regresses).
-        """
-        q_sim = self.data.qpos[3:9].astype(np.float32)
-        best_phase = (self._phase + 1) % self._ref_len
-        best_err   = np.sum((q_sim - self._reference[best_phase]) ** 2)
-
-        for dt in range(2, self._max_phase_advance + 1):
-            candidate = (self._phase + dt) % self._ref_len
-            err = np.sum((q_sim - self._reference[candidate]) ** 2)
-            if err < best_err:
-                best_err   = err
-                best_phase = candidate
-
-        self._phase = best_phase
+        self._phase = (self._phase + 1) % self._ref_len
 
     # ── reset ─────────────────────────────────────────────────────────────
 
@@ -215,21 +263,61 @@ class Walker2dPhaseAware(Walker2dEnv):
         q_ref  = self._reference[self._phase]
         dq_ref = self._ref_vel[self._phase]
 
-        diff    = q_sim - q_ref
-        diff_v  = dq_sim - dq_ref
+        diff   = q_sim - q_ref
+        diff_v = dq_sim - dq_ref
 
-        # ── sub-rewards, each normalised to [0, 1] ────────────────────
         k = self._imit_scale
-        # Per-joint averages → [0, 1]; all joints must track to reach 1.
-        imit_r   = float(np.mean(np.exp(-k       * diff   ** 2)))
-        vel_r    = float(np.mean(np.exp(-k * 0.01 * diff_v ** 2)))
 
-        # ── forward velocity reward ───────────────────────────────────
-        x_vel = float(info.get("x_velocity", self.data.qvel[0]))
-        fwd_r = float(np.exp(-5.0 * (x_vel - self._v_target) ** 2))
+        # ── joint pose tracking  (DeepMimic: k_p = 2 for 3D; k=8 fine for 6-DOF 2D)
+        imit_r = float(np.mean(np.exp(-k * diff ** 2)))
+
+        # ── joint velocity tracking  (DeepMimic: k_v = 0.1)
+        vel_r = float(np.mean(np.exp(-0.1 * diff_v ** 2)))
+
+        # ── end-effector (foot position) tracking ─────────────────────
+        # Two components per foot:
+        #   x_rel: foot x relative to root — forward placement signal
+        #   z_world: foot z in world frame — swing clearance signal
+        #            (world-z is ~0 at stance, >0 during swing;
+        #             root-relative-z is always ~-1.1m with no swing signal)
+        root_xpos = self.data.body("torso").xpos
+        ftr_xpos  = self.data.body("foot").xpos
+        ftl_xpos  = self.data.body("foot_left").xpos
+
+        # Root-relative (x, z) — z goes from -1.29 (stance) to -0.89 (swing peak),
+        # a 0.4m range that is the actual swing clearance signal.
+        foot_r_xrel = ftr_xpos[0] - root_xpos[0]
+        foot_r_zrel = ftr_xpos[2] - root_xpos[2]
+        foot_l_xrel = ftl_xpos[0] - root_xpos[0]
+        foot_l_zrel = ftl_xpos[2] - root_xpos[2]
+        # x placement: k=40 (cm-level accuracy)
+        # z clearance: k=40 during stance, k=200 during swing — much sharper
+        # penalty when the reference says the foot should be elevated but it's dragging.
+        SWING_CLEARANCE = -1.05  # root-relative z threshold: above this = swing phase
+        r_is_swing = self._ref_foot_r_z[self._phase] > SWING_CLEARANCE
+        l_is_swing = self._ref_foot_l_z[self._phase] > SWING_CLEARANCE
+        kz_r = 200.0 if r_is_swing else 40.0
+        kz_l = 200.0 if l_is_swing else 40.0
+
+        ee_err_r_x = (foot_r_xrel - self._ref_foot_r_xrel[self._phase]) ** 2
+        ee_err_l_x = (foot_l_xrel - self._ref_foot_l_xrel[self._phase]) ** 2
+        ee_err_r_z = (foot_r_zrel - self._ref_foot_r_z[self._phase])    ** 2
+        ee_err_l_z = (foot_l_zrel - self._ref_foot_l_z[self._phase])    ** 2
+        ee_r = float(0.25 * (np.exp(-40.0 * ee_err_r_x) +
+                              np.exp(-40.0 * ee_err_l_x) +
+                              np.exp(-kz_r  * ee_err_r_z) +
+                              np.exp(-kz_l  * ee_err_l_z)))
+
+        # ── root tracking (height + pitch) ────────────────────────────
+        # DeepMimic: k_root = 10, pitch coeff = 0.1 * root_rot_err.
+        # Our pitch exploit needs coeff = 1.0 to actually penalise lean.
+        root_height = float(root_xpos[2])
+        root_pitch  = float(self.data.qpos[2])
+        ref_height  = float(self._ref_root_height[self._phase])
+        root_err = (root_height - ref_height) ** 2 + 3.0 * root_pitch ** 2
+        root_r = float(np.exp(-10.0 * root_err))
 
         # ── contact alternation reward ────────────────────────────────
-        # Body indices: 4=foot (right), 7=foot_left
         foot_r_frc = float(np.linalg.norm(self.data.cfrc_ext[4]))
         foot_l_frc = float(np.linalg.norm(self.data.cfrc_ext[7]))
         if self._stance_right[self._phase]:
@@ -241,43 +329,37 @@ class Walker2dPhaseAware(Walker2dEnv):
         # ── ctrl cost ─────────────────────────────────────────────────
         ctrl_cost = -1e-3 * float(np.sum(np.square(self.data.ctrl)))
 
-        if self._product_reward:
-            # DeepMimic product form: all components must be satisfied simultaneously.
-            # Each sub-reward is in [0,1]; product → geometric mean weighted by w_i.
-            # r = dt * (imit^w_i * vel^w_v * fwd^w_f * contact^w_c)^(1/sum_w) + ctrl
-            w_i = self._imitation_weight
-            w_v = self._vel_weight
-            w_f = self._forward_weight
-            w_c = self._contact_weight
-            total_w = w_i + w_v + w_f + w_c
-            combined = (
-                imit_r    ** w_i *
-                vel_r     ** w_v *
-                fwd_r     ** w_f *
-                (contact_r + 1e-8) ** w_c   # avoid 0^w_c blowing up
-            ) ** (1.0 / total_w)
-            reward = self.dt * combined * total_w + ctrl_cost
-        else:
-            # Weighted sum form (original, but sub-rewards now averaged not summed).
-            # Multiply by N_REF (6) to keep scale comparable to the old sum.
-            reward = (self._imitation_weight * self.dt * self.N_REF * imit_r
-                      + self._vel_weight     * self.dt * self.N_REF * vel_r
-                      + self._forward_weight * self.dt              * fwd_r
-                      + self._contact_weight * self.dt              * contact_r
-                      + ctrl_cost)
+        # ── combine (DeepMimic-inspired weighted sum) ──────────────────
+        # Scale by dt so returns are time-invariant across episode lengths.
+        # Pose/vel scale by N_REF=6 (one term per joint); EE scales by 2
+        # (one per foot); root and contact are scalar.
+        # Approximate DeepMimic weight ratio: pose(0.65) vel(0.1) ee(0.15) root(0.1)
+        reward = (self._imitation_weight * self.dt * self.N_REF * imit_r
+                  + self._vel_weight     * self.dt * self.N_REF * vel_r
+                  + self._ee_weight      * self.dt * 2          * ee_r
+                  + self._root_weight    * self.dt              * root_r
+                  + self._contact_weight * self.dt              * contact_r
+                  + ctrl_cost)
 
         # ── termination ───────────────────────────────────────────────
+        # super().step() already terminates on root height out of [0.8, 2.0].
+        # Pitch termination: kill episode on forward/backward lean > 0.3 rad (~17°).
+        # This forces the agent to maintain upright posture — without it the agent
+        # learns controlled forward falling which is never penalized until height drops.
+        if abs(root_pitch) > 0.3:
+            terminated = True
         ankle_dev = max(abs(diff[2]), abs(diff[5]))
         other_dev = max(abs(diff[0]), abs(diff[1]), abs(diff[3]), abs(diff[4]))
         if ankle_dev > self._ankle_term_thresh or other_dev > self._pose_term_thresh:
             terminated = True
+        x_vel = float(info.get("x_velocity", self.data.qvel[0]))
         if x_vel < -0.1:
             terminated = True
 
         # ── advance phase (after reward/termination use current phase) ─
         self._advance_phase()
 
-        info.update(imit_r=imit_r, vel_r=vel_r, fwd_r=fwd_r, phase=self._phase)
+        info.update(imit_r=imit_r, vel_r=vel_r, ee_r=ee_r, root_r=root_r, phase=self._phase)
         return self._get_obs(), reward, terminated, truncated, info
 
 
@@ -336,11 +418,14 @@ def main():
     parser.add_argument("--finetune",    default=None,
                         help="Pretrained .zip to finetune from")
 
-    # reward weights
+    # reward weights (DeepMimic-style: pose, vel, ee, root, contact)
     parser.add_argument("--imit_weight",    type=float, default=4.0)
     parser.add_argument("--vel_weight",     type=float, default=1.0)
-    parser.add_argument("--forward_weight", type=float, default=1.0)
-    parser.add_argument("--contact_weight", type=float, default=2.0)
+    parser.add_argument("--ee_weight",      type=float, default=4.0,
+                        help="End-effector foot position tracking weight")
+    parser.add_argument("--root_weight",    type=float, default=2.0,
+                        help="Root height + pitch tracking weight")
+    parser.add_argument("--contact_weight", type=float, default=1.0)
 
     # phase tracking
     parser.add_argument("--max_phase_advance", type=int,   default=4,
@@ -394,7 +479,8 @@ def main():
                 reference         = reference,
                 imitation_weight  = args.imit_weight,
                 vel_weight        = args.vel_weight,
-                forward_weight    = args.forward_weight,
+                ee_weight         = args.ee_weight,
+                root_weight       = args.root_weight,
                 contact_weight    = args.contact_weight,
                 max_phase_advance = args.max_phase_advance,
                 pose_term_thresh  = args.pose_term,
@@ -434,7 +520,7 @@ def main():
         )
 
     checkpoint_cb = CheckpointCallback(
-        save_freq  = max(500_000 // args.num_envs, 1),
+        save_freq  = max(5_000_000 // args.num_envs, 1),
         save_path  = str(log_dir / "checkpoints"),
         name_prefix= "model",
         verbose    = 0,
